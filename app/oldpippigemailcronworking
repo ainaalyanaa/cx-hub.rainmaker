@@ -1,0 +1,151 @@
+<?php
+
+namespace App\Console\Commands;
+
+use App\Models\Attachment;
+use App\Models\Role;
+use App\Models\Ticket;
+use App\Models\User;
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
+use Webklex\IMAP\Facades\Client;
+
+class PipipingEmail extends Command
+{
+    protected $signature = 'command:piping_email';
+    protected $description = 'Fetch ALL emails from IMAP and convert them into tickets';
+
+    public function handle()
+    {
+        $this->info('COMMAND STARTED');
+        Log::info('COMMAND STARTED');
+
+        try {
+            $client = Client::account('default');
+            $client->connect();
+        } catch (\Throwable $e) {
+            Log::error('IMAP connection failed: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+
+        try {
+            $folder = $client->getFolder('INBOX');
+        } catch (\Throwable $e) {
+            Log::error('Unable to access INBOX: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+
+        try {
+            // 🔥 FETCH ALL MESSAGES – NO FILTERS
+            $messages = $folder->messages()
+                ->all()
+                ->setFetchOrder('asc')
+                ->limit(50)
+                ->get();
+
+            $this->info('Messages found: ' . $messages->count());
+            Log::info('Messages found: ' . $messages->count());
+
+        } catch (\Throwable $e) {
+            Log::error('Failed fetching messages: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+
+        foreach ($messages as $message) {
+            try {
+                $messageId = $message->getMessageId();
+
+                $this->info('Processing message: ' . $messageId);
+                Log::info('Processing message: ' . $messageId);
+
+                $from = $message->getFrom();
+                if (empty($from)) {
+                    Log::warning('Message skipped: no FROM');
+                    continue;
+                }
+
+                $fromData = $from[0];
+
+                // Create or get user
+                $roleId = Role::where('slug', 'customer')->value('id') ?? 5;
+                [$firstName, $lastName] = $this->split_name($fromData->personal ?? '');
+
+                $user = User::firstOrCreate(
+                    ['email' => $fromData->mail],
+                    [
+                        'password' => bcrypt('secret'),
+                        'role_id' => $roleId,
+                        'first_name' => $firstName,
+                        'last_name' => $lastName,
+                    ]
+                );
+
+                // Create ticket
+                $ticket = Ticket::create([
+                    'subject' => $message->getSubject() ?? '(No Subject)',
+                    'details' => $message->getHTMLBody() ?? $message->getTextBody(),
+                    'user_id' => $user->id,
+                    'open' => now(),
+                    'response' => null,
+                    'due' => null,
+                ]);
+
+                // Handle attachments
+                $message->getAttachments()->each(function ($attachment) use ($message, $ticket, $user) {
+                    try {
+                        $originName = $message->getMessageId() . '_' . $attachment->name;
+                        $storagePath = public_path('files/tickets/');
+
+                        if (!is_dir($storagePath)) {
+                            mkdir($storagePath, 0775, true);
+                        }
+
+                        file_put_contents(
+                            $storagePath . $originName,
+                            $attachment->content
+                        );
+
+                        Attachment::create([
+                            'ticket_id' => $ticket->id,
+                            'name' => $attachment->name,
+                            'size' => $attachment->size,
+                            'path' => 'tickets/' . $originName,
+                            'user_id' => $user->id,
+                        ]);
+                    } catch (\Throwable $e) {
+                        Log::error('Attachment error: ' . $e->getMessage());
+                    }
+                });
+
+                // Mark message as seen AFTER success
+                $message->setFlag('SEEN');
+
+            } catch (\Throwable $e) {
+                Log::error('Message processing error: ' . $e->getMessage());
+            }
+        }
+
+        $this->info('COMMAND FINISHED');
+        Log::info('COMMAND FINISHED');
+
+        return Command::SUCCESS;
+    }
+
+    private function split_name(string $name): array
+    {
+        $name = trim($name);
+        if ($name === '') {
+            return ['', ''];
+        }
+
+        $lastName = (strpos($name, ' ') === false)
+            ? ''
+            : preg_replace('#.*\s([\w-]*)$#', '$1', $name);
+
+        $firstName = trim(
+            preg_replace('#' . preg_quote($lastName, '#') . '#', '', $name)
+        );
+
+        return [$firstName, $lastName];
+    }
+}
